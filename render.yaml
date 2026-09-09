@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: phiz-notificacao-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: PHIZ_BASE_URL
+        value: https://app.phiz.chat
+      - key: PHIZ_CHANNEL_ID
+        value: "929"
+      - key: ACADEMIC_API_BASE_URL
+        value: https://ijf-dev-api.onrender.com
+      - key: ACADEMIC_API_TIMEOUT_SECONDS
+        value: "60"
+      - key: QUEUE_WORKERS
+        value: "4"
+      - key: SECRETARY_INBOUND_API_KEY
+        sync: false
+      - key: PHIZ_APP_ID
+        sync: false
+      - key: PHIZ_APP_SECRET
+        sync: false
