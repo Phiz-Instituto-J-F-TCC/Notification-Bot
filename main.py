@@ -3,29 +3,143 @@ import os
 import re
 import threading
 from html import unescape
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
-from flask import Flask, jsonify, request
+from fastapi import FastAPI, HTTPException, Security, status
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, ConfigDict, Field
 
 import config
 from outbound_queue import QueueFullError, outbound_queue
 
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = config.MAX_JSON_SIZE_BYTES
+class StudentRequest(BaseModel):
+    cpf: str = Field(
+        min_length=11,
+        max_length=14,
+        examples=["522.839.868-69"],
+        description="CPF do aluno. Pode chegar formatado ou somente com dígitos.",
+    )
+
+
+class NotificationRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "example": {
+                "notificationId": "notificacao-001",
+                "topic": "Aviso importante",
+                "message": "Esta mensagem será enviada aos alunos.",
+                "category": {"categoryId": 6, "name": "SCHEDULE"},
+                "alert": False,
+                "important": True,
+                "shippingTime": "2026-09-09T12:00:00.000Z",
+                "students": [
+                    {"cpf": "522.839.868-69"},
+                    {"cpf": "420.703.128-81"},
+                ],
+            }
+        },
+    )
+
+    notificationId: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Identificador único usado para impedir envios duplicados.",
+    )
+    topic: str = Field(default="Notificação", min_length=1, max_length=300)
+    message: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Texto da mensagem. Use message ou content.",
+    )
+    content: str | None = Field(
+        default=None,
+        description="URL HTTPS de um HTML. Use content ou message.",
+    )
+    students: list[StudentRequest] = Field(min_length=1)
+    category: dict[str, Any] | None = None
+    alert: bool | None = None
+    important: bool | None = None
+    shippingTime: str | None = None
+
+
+class JobCreated(BaseModel):
+    cpf_final: str
+    job_id: str
+    status: str
+
+
+class ProcessingError(BaseModel):
+    cpf_final: str
+    erro: str
+
+
+class NotificationResponse(BaseModel):
+    received: bool
+    notificationId: str
+    status: str
+    jobs: list[JobCreated]
+    errors: list[ProcessingError]
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    cpf_final: str
+    message_id: str | None = None
+    telefone_final: str | None = None
+    erro: str | None = None
+
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    missing_settings: list[str]
+
+
+app = FastAPI(
+    title="API de Notificações Phiz",
+    summary="Envio de notificações para alunos por CPF",
+    description=(
+        "Recebe uma notificação com um ou vários CPFs, cria jobs assíncronos, "
+        "consulta os telefones na API acadêmica e envia as mensagens pela Phiz.\n\n"
+        "Nos endpoints protegidos, clique em **Authorize** e informe "
+        "`API-Key SUA_CHAVE`."
+    ),
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    openapi_tags=[
+        {"name": "Sistema", "description": "Saúde e configuração da API."},
+        {"name": "Notificações", "description": "Recebimento das notificações."},
+        {"name": "Jobs", "description": "Acompanhamento dos envios assíncronos."},
+    ],
+)
+
+api_key_header = APIKeyHeader(
+    name="Authorization",
+    scheme_name="InboundApiKey",
+    description="Informe no formato: API-Key SUA_CHAVE",
+    auto_error=False,
+)
 
 notification_jobs = {}
 notification_jobs_lock = threading.Lock()
 
 
-def _authorized():
-    if not config.SECRETARY_INBOUND_API_KEY:
-        return False
+def verify_api_key(api_key: str | None = Security(api_key_header)):
+    if not config.SECRETARY_INBOUND_API_KEY or not api_key:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
     expected = f"API-Key {config.SECRETARY_INBOUND_API_KEY}"
-    received = request.headers.get("Authorization", "")
-    return hmac.compare_digest(received, expected)
+    if not hmac.compare_digest(api_key, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return api_key
 
 
 def _format_cpf(cpf):
@@ -76,68 +190,81 @@ def _get_content_text(content_url):
 
 
 def _build_message(payload):
-    topic = payload.get("topic") or "Notificação"
-    if not isinstance(topic, str) or not topic.strip():
-        raise ValueError("topic deve ser uma string não vazia")
-
-    message = payload.get("message")
-    if message is not None:
-        if not isinstance(message, str) or not message.strip():
-            raise ValueError("message deve ser uma string não vazia")
-        text = message.strip()
-    else:
-        content_url = payload.get("content")
-        if not isinstance(content_url, str) or not content_url.strip():
-            raise ValueError("Informe message ou content com a URL do HTML")
-        text = _get_content_text(content_url.strip())
+    if payload.message is not None:
+        text = payload.message.strip()
+    elif payload.content is not None and payload.content.strip():
+        text = _get_content_text(payload.content.strip())
         if not text:
             raise ValueError("O conteúdo da notificação está vazio")
+    else:
+        raise ValueError("Informe message ou content com a URL do HTML")
 
-    return f"{topic.strip()}\n\n{text}"
+    return f"{payload.topic.strip()}\n\n{text}"
 
 
-@app.get("/")
-@app.get("/health")
+@app.get(
+    "/",
+    response_model=HealthResponse,
+    tags=["Sistema"],
+    summary="Verificar a API",
+)
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["Sistema"],
+    summary="Health check do Render",
+)
 def health():
     missing = config.missing_required_settings()
-    return jsonify({
-        "status": "ok" if not missing else "configuration_error",
-        "service": "notificacao-phiz",
-        "missing_settings": missing,
-    }), 200 if not missing else 503
+    response = HealthResponse(
+        status="ok" if not missing else "configuration_error",
+        service="notificacao-phiz",
+        missing_settings=missing,
+    )
+    if missing:
+        return JSONResponse(status_code=503, content=response.model_dump())
+    return response
 
 
-@app.post("/webhook/aluno-notificacao")
-def notification_webhook():
-    if not _authorized():
-        return jsonify({"error": "unauthorized"}), 401
-
+@app.post(
+    "/webhook/aluno-notificacao",
+    response_model=NotificationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Notificações"],
+    summary="Receber e enfileirar uma notificação",
+    description=(
+        "Aceita um ou vários CPFs. Um job independente é criado para cada CPF "
+        "não repetido. A resposta 202 significa que os jobs foram enfileirados."
+    ),
+    responses={
+        400: {"description": "Mensagem, conteúdo ou CPF inválido."},
+        401: {"description": "Chave da API ausente ou inválida."},
+        503: {"description": "Configuração incompleta ou fila cheia."},
+    },
+)
+def notification_webhook(
+    payload: NotificationRequest,
+    _api_key: str = Security(verify_api_key),
+):
     missing = config.missing_required_settings()
     if missing:
-        return jsonify({"error": "configuration_error", "missing_settings": missing}), 503
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "configuration_error", "missing_settings": missing},
+        )
 
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Envie um objeto JSON válido"}), 400
-
-    notification_id = payload.get("notificationId")
-    if not isinstance(notification_id, str) or not notification_id.strip():
-        return jsonify({"error": "notificationId deve ser uma string não vazia"}), 400
-    notification_id = notification_id.strip()
-
-    students = payload.get("students")
-    if not isinstance(students, list) or not students:
-        return jsonify({"error": "students deve ser uma lista não vazia"}), 400
-
+    notification_id = payload.notificationId.strip()
     cpfs = []
     seen_cpfs = set()
-    for index, student in enumerate(students):
-        if not isinstance(student, dict):
-            return jsonify({"error": f"students[{index}] deve ser um objeto"}), 400
+
+    for index, student in enumerate(payload.students):
         try:
-            cpf = _format_cpf(student.get("cpf"))
+            cpf = _format_cpf(student.cpf)
         except ValueError as exc:
-            return jsonify({"error": f"students[{index}].cpf: {exc}"}), 400
+            raise HTTPException(
+                status_code=400,
+                detail=f"students[{index}].cpf: {exc}",
+            ) from exc
         if cpf not in seen_cpfs:
             seen_cpfs.add(cpf)
             cpfs.append(cpf)
@@ -145,9 +272,12 @@ def notification_webhook():
     try:
         body = _build_message(payload)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except requests.RequestException as exc:
-        return jsonify({"error": f"Falha ao obter content: {exc}"}), 502
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha ao obter content: {exc}",
+        ) from exc
 
     jobs = []
     errors = []
@@ -165,52 +295,59 @@ def notification_webhook():
                 try:
                     job_id = outbound_queue.enqueue(cpf, body)
                 except QueueFullError:
-                    errors.append({
-                        "cpf_final": cpf_final,
-                        "erro": "Fila temporariamente cheia",
-                    })
+                    errors.append(
+                        ProcessingError(
+                            cpf_final=cpf_final,
+                            erro="Fila temporariamente cheia",
+                        )
+                    )
                     continue
                 notification_jobs[key] = job_id
                 job_status = "enfileirado"
 
-        jobs.append({
-            "cpf_final": cpf_final,
-            "job_id": job_id,
-            "status": job_status,
-        })
+        jobs.append(
+            JobCreated(
+                cpf_final=cpf_final,
+                job_id=job_id,
+                status=job_status,
+            )
+        )
+
+    response = NotificationResponse(
+        received=bool(jobs),
+        notificationId=notification_id,
+        status="parcial" if jobs and errors else ("enfileirado" if jobs else "falha"),
+        jobs=jobs,
+        errors=errors,
+    )
 
     if not jobs:
-        return jsonify({
-            "received": False,
-            "notificationId": notification_id,
-            "status": "falha",
-            "jobs": [],
-            "errors": errors,
-        }), 503
-
-    return jsonify({
-        "received": True,
-        "notificationId": notification_id,
-        "status": "parcial" if errors else "enfileirado",
-        "jobs": jobs,
-        "errors": errors,
-    }), 202
+        return JSONResponse(status_code=503, content=response.model_dump())
+    return response
 
 
-@app.get("/jobs/<job_id>")
-def get_job(job_id):
-    if not _authorized():
-        return jsonify({"error": "unauthorized"}), 401
-
+@app.get(
+    "/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    summary="Consultar o estado de um envio",
+    responses={
+        401: {"description": "Chave da API ausente ou inválida."},
+        404: {"description": "Job não encontrado."},
+    },
+)
+def get_job(job_id: str, _api_key: str = Security(verify_api_key)):
     result = outbound_queue.get_result(job_id)
     if result is None:
-        return jsonify({"error": "job_not_found"}), 404
-    return jsonify(result), 200
+        raise HTTPException(status_code=404, detail="job_not_found")
+    return result
 
 
 if __name__ == "__main__":
-    app.run(
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "5000")),
-        debug=False,
+        port=int(os.getenv("PORT", "8000")),
     )

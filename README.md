@@ -3,18 +3,24 @@
 Web Service que recebe uma notificação em JSON, cria um job para cada CPF,
 consulta o telefone na API acadêmica e envia a mensagem pelo canal da Phiz.
 
+A aplicação usa FastAPI e disponibiliza automaticamente:
+
+- Swagger UI: `/docs`
+- ReDoc: `/redoc`
+- Especificação OpenAPI: `/openapi.json`
+
 ## Render
 
 - Runtime: Python
 - Build Command: `pip install -r requirements.txt`
-- Start Command: `gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180`
+- Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path: `/health`
 
 Configure as variáveis do arquivo `.env.example` no painel do Render. Não envie
 um arquivo `.env` com credenciais para o repositório.
 
-O projeto usa um processo Gunicorn porque a fila e a deduplicação ainda ficam
-em memória. Para múltiplas instâncias, substitua a fila por Redis/RQ, Celery ou
+O projeto usa um processo Uvicorn porque a fila e a deduplicação ainda ficam em
+memória. Para múltiplas instâncias, substitua a fila por Redis/RQ, Celery ou
 outro serviço persistente.
 
 ## Criar notificação
